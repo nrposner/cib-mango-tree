@@ -28,6 +28,10 @@ from ..base_dashboard import BaseDashboardPage
 from .data import filter_ngrams_by_text, make_detail_columns, make_summary_columns
 from .plots import SamplingMetadata, plot_scatter_echart, sample_ngram_data
 
+# Number of suggestions to match server-side and send to the browser
+MAX_AUTOCOMPLETE_OPTIONS = 50
+MIN_AUTOCOMPLETE_CHARS = 2
+
 
 class NgramsDashboardPage(BaseDashboardPage):
     """
@@ -234,7 +238,41 @@ class NgramsDashboardPage(BaseDashboardPage):
     def _handle_filter_change(self, e) -> None:
         self._filter_text = e.value if e.value else None
         self._filter_applied = False
+        self._refresh_autocomplete()
         self._update_info_label()
+
+    def _refresh_autocomplete(self) -> None:
+        """
+        Offer suggestions for what the user has typed so far.
+
+        Matches internally to avoid handing the websocket too much information
+        and sabotaging the connection
+        """
+        if self._ngram_select is None:
+            return
+
+        text = (self._filter_text or "").strip()
+        if self._df_stats is None or len(text) < MIN_AUTOCOMPLETE_CHARS:
+            self._all_ngram_options = []
+            self._ngram_select.set_autocomplete([])
+            return
+
+        try:
+            matches = (
+                filter_ngrams_by_text(self._df_stats, text)
+                .select(COL_NGRAM_WORDS)
+                .unique()
+                .sort(COL_NGRAM_WORDS)
+                .head(MAX_AUTOCOMPLETE_OPTIONS)
+                .to_series()
+                .to_list()
+            )
+        except Exception:
+            # A partially typed value can be an invalid regex, offer nothing
+            matches = []
+
+        self._all_ngram_options = matches
+        self._ngram_select.set_autocomplete(matches)
 
     def _handle_enter_press(self, e) -> None:
         self._selected_words = None
@@ -270,6 +308,7 @@ class NgramsDashboardPage(BaseDashboardPage):
         self._selected_data_index = None
         self._clear_all_highlights()
 
+        self._refresh_autocomplete()
         self._update_chart_with_filter()
         self._update_grid()
         self._update_info_label()
@@ -318,14 +357,8 @@ class NgramsDashboardPage(BaseDashboardPage):
                 self._show_error(self._chart_loading, f"Could not build chart: {exc}")
             return
 
-        if self._ngram_select is not None:
-            self._all_ngram_options = (
-                self._df_stats.select(pl.col(COL_NGRAM_WORDS).unique())
-                .sort(COL_NGRAM_WORDS)
-                .to_series()
-                .to_list()
-            )
-            self._ngram_select.set_autocomplete(self._all_ngram_options)
+        # suggestions computed per keystroke in _handle_filter_change
+        self._refresh_autocomplete()
 
         if (
             self._chart is None
