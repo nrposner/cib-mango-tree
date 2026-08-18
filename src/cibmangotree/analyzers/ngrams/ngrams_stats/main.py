@@ -147,6 +147,43 @@ def _create_full_report_slice(
     )
 
 
+# Target number of report rows to materialize at once. Each n-gram contributes
+# exactly `total_reps` rows, and every row carries a full copy of its message text,
+# so this is the knob that bounds peak memory while writing the full report.
+
+# How many rows we aim to materialize at once. Bounds peak memory when writing the report
+REPORT_ROWS_PER_SLICE = 100_000
+
+
+def _report_slice_row_counts(df_ngram_summary: pl.DataFrame) -> list[int]:
+    """
+    Split the summary into consecutive slices of approx. REPORT_ROWS_PER_SLICE
+    report rows, returning the number of n-grams in each slice.
+
+    Sizing slices by n-gram *count* (rows // mean reps) has a pathological case
+    on large datasets with large n-gram counts, as total_reps is power-law
+    distributed and we can end up producing slices 100x larger than intended.
+    By budgeting on the cumulative total_reps, we keep slice sizes much closer
+    to target.
+
+    An n-gram whose own total_reps exceeds the budget still gets its own slice,
+    since we can't currently split it up further.
+    """
+    if df_ngram_summary.height == 0:
+        return []
+
+    return (
+        df_ngram_summary.select(
+            (
+                (pl.col(COL_NGRAM_TOTAL_REPS).cum_sum() - 1) // REPORT_ROWS_PER_SLICE
+            ).alias("_slice")
+        )
+        .group_by("_slice", maintain_order=True)
+        .len()["len"]
+        .to_list()
+    )
+
+
 def main(context: SecondaryAnalyzerContext):
     progress = context.progress_reporter or (lambda name: NullProgressReporter(name))
 
@@ -167,10 +204,7 @@ def main(context: SecondaryAnalyzerContext):
     df_message_ngrams_schema = df_message_ngrams.to_arrow().schema
     df_ngram_summary_schema = df_ngram_summary.to_arrow().schema
 
-    # Guard against divide-by-zero on an empty definitions table
-    average_cardinality_explosion_factor = (
-        df_message_ngrams.height // df_ngrams.height if df_ngrams.height else 1
-    )
+    report_slice_row_counts = _report_slice_row_counts(df_ngram_summary)
 
     with progress("Writing full report") as reporter:
         with pq.ParquetWriter(
@@ -191,17 +225,17 @@ def main(context: SecondaryAnalyzerContext):
                 ]
             ),
         ) as writer:
-            report_slice_size = max(1, 100_000 // average_cardinality_explosion_factor)
             report_total_processed = 0
-            for df_ngram_summary_slice in df_ngram_summary.iter_slices(
-                report_slice_size
-            ):
+            for slice_height in report_slice_row_counts:
+                df_ngram_summary_slice = df_ngram_summary.slice(
+                    report_total_processed, slice_height
+                )
                 print(
                     f"Writing report "
                     f"{report_total_processed}/{df_ngram_summary.height}",
                     end="\r",
                 )
-                report_total_processed += df_ngram_summary_slice.height
+                report_total_processed += slice_height
 
                 df_output = _create_full_report_slice(
                     df_ngram_summary_slice, df_message_ngrams, df_messages
