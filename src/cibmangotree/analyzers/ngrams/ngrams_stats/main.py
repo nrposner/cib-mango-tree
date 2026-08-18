@@ -224,6 +224,11 @@ def main(context: SecondaryAnalyzerContext):
                     df_messages_schema.field(COL_MESSAGE_TIMESTAMP),
                 ]
             ),
+            # unlike polars, which defaults to zstd, pyarrow defaults to snappy,
+            # which isn't as effective at compression, switching it on manually,
+            # since this is the largest file we produce and benefits from
+            # superior compression
+            compression="zstd",
         ) as writer:
             report_total_processed = 0
             for slice_height in report_slice_row_counts:
