@@ -104,10 +104,18 @@ def _create_full_report_slice(
     Returns:
         Detailed report DataFrame with per-user repetition counts, sorted
     """
+    # The report does not carry message_text, so drop before the join rather
+    # than fanning out and duplicating across many rows
+    df_messages_meta = (
+        df_messages.drop(COL_MESSAGE_TEXT)
+        if COL_MESSAGE_TEXT in df_messages.columns
+        else df_messages
+    )
+
     return (
         (
             df_ngram_summary_slice.join(df_message_ngrams, on=COL_NGRAM_ID).join(
-                df_messages, on=COL_MESSAGE_SURROGATE_ID
+                df_messages_meta, on=COL_MESSAGE_SURROGATE_ID
             )
         )
         # count how many times a user posted distint ngrams
@@ -128,7 +136,6 @@ def _create_full_report_slice(
                 COL_NGRAM_REPS_PER_USER,
                 COL_MESSAGE_SURROGATE_ID,
                 COL_MESSAGE_ID,
-                COL_MESSAGE_TEXT,
                 COL_MESSAGE_TIMESTAMP,
             ]
         )
@@ -220,7 +227,7 @@ def main(context: SecondaryAnalyzerContext):
                     pa.field(COL_NGRAM_REPS_PER_USER, pa.int32()),
                     df_messages_schema.field(COL_MESSAGE_SURROGATE_ID),
                     df_messages_schema.field(COL_MESSAGE_ID),
-                    df_messages_schema.field(COL_MESSAGE_TEXT),
+                    # message_text omitted on purpose and re-joined on export
                     df_messages_schema.field(COL_MESSAGE_TIMESTAMP),
                 ]
             ),

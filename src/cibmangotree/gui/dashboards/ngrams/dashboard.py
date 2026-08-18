@@ -9,6 +9,11 @@ a point filters the data grid to show all occurrences of that n-gram.
 import polars as pl
 from nicegui import run, ui
 
+from cibmangotree.analyzers.ngrams.ngrams_base.interface import (
+    COL_MESSAGE_SURROGATE_ID,
+    COL_MESSAGE_TEXT,
+    OUTPUT_MESSAGE,
+)
 from cibmangotree.analyzers.ngrams.ngrams_stats.interface import (
     COL_NGRAM_WORDS,
     OUTPUT_NGRAM_FULL,
@@ -53,6 +58,7 @@ class NgramsDashboardPage(BaseDashboardPage):
 
         self._df_stats: pl.DataFrame | None = None
         self._df_full: pl.DataFrame | None = None
+        self._messages_path: str | None = None
         self._df_stats_sampled: pl.DataFrame | None = None
         self._sampling_metadata: SamplingMetadata | None = None
 
@@ -80,9 +86,38 @@ class NgramsDashboardPage(BaseDashboardPage):
         if self._df_full is None or self._df_full.is_empty():
             return pl.DataFrame()
 
-        return self._df_full.filter(pl.col(COL_NGRAM_WORDS) == words).pipe(
-            make_detail_columns
-        )
+        rows = self._df_full.filter(pl.col(COL_NGRAM_WORDS) == words)
+        return self._attach_message_text(rows).pipe(make_detail_columns)
+
+    def _attach_message_text(self, rows: pl.DataFrame) -> pl.DataFrame:
+        """
+        Look up post text for the rows being displayed.
+
+        The full report omits message_text so it is fetched here for just the
+        selected n-gram's rows rather than being held in memory for the whole
+        corpus.
+        """
+        if COL_MESSAGE_TEXT in rows.columns or self._messages_path is None:
+            return rows
+        if rows.is_empty():
+            return rows.with_columns(
+                pl.lit(None, dtype=pl.String).alias(COL_MESSAGE_TEXT)
+            )
+
+        wanted = rows[COL_MESSAGE_SURROGATE_ID].unique()
+        try:
+            texts = (
+                pl.scan_parquet(self._messages_path)
+                .select(COL_MESSAGE_SURROGATE_ID, COL_MESSAGE_TEXT)
+                .filter(pl.col(COL_MESSAGE_SURROGATE_ID).is_in(wanted))
+                .collect()
+            )
+        except Exception:
+            return rows.with_columns(
+                pl.lit(None, dtype=pl.String).alias(COL_MESSAGE_TEXT)
+            )
+
+        return rows.join(texts, on=COL_MESSAGE_SURROGATE_ID, how="left")
 
     def _update_info_label(self) -> None:
         if self._info_label is None:
@@ -242,6 +277,7 @@ class NgramsDashboardPage(BaseDashboardPage):
     async def _load_and_render_async(self) -> None:
         stats_path = self.get_output_parquet_path(OUTPUT_NGRAM_STATS)
         full_path = self.get_output_parquet_path(OUTPUT_NGRAM_FULL)
+        self._messages_path = self.get_primary_output_parquet_path(OUTPUT_MESSAGE)
 
         if stats_path is None:
             if self._chart_loading is not None:
