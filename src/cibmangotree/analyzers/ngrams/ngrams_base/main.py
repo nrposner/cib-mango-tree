@@ -59,10 +59,18 @@ MIN_ROWS_FOR_PARALLEL = 5_000
 # Several chunks per worker so uneven message lengths still balance across cores.
 CHUNKS_PER_WORKER = 4
 
+# Internal only, identifies an n-gram while its text is not being carried
+COL_NGRAM_HASH = "ngram_hash"
+
+# Fixed so hashes are identical across worker processes runs. Polars' hash is
+# stable for a given seed, but Python's hash() is not because of PYTHONHASHSEED
+# randomisation, must not be used here
+NGRAM_HASH_SEED = 0
+
 
 def _emit_ngram_pairs(
     payload: tuple[list[int], list[str], int, int, TokenizerConfig],
-) -> pl.DataFrame:
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     """
     Tokenize a chunk of messages and emit one row per (message, distinct n-gram).
 
@@ -70,11 +78,19 @@ def _emit_ngram_pairs(
     arguments. It does not assign n-gram ids at this stage, in order to avoid
     a cross-chunk counter.
 
+    The occurrence table identifies each n-gram by hash rather than text, which
+    is returned separately once per n-gram per chunk. This avoids having to
+    hold a copy of every n-gram string per message it appears in, which is
+    prohibitive on large corpuses. This also allows us to group and join on
+    integers rather than strings
+
     Args:
         payload: (surrogate_ids, texts, min_n, max_n, tokenizer_config)
 
     Returns:
-        DataFrame with columns [message_surrogate_id, words]
+        (df_pairs, df_chunk_defs) where
+        - df_pairs: columns [message_surrogate_id, ngram_hash]
+        - df_chunk_defs: columns [ngram_hash, words], distinct within this chunk
     """
     surrogate_ids, texts, min_n, max_n, tokenizer_config = payload
 
@@ -98,17 +114,24 @@ def _emit_ngram_pairs(
             out_surrogate_ids.append(surrogate_id)
             out_words.append(serialized_ngram)
 
-    return pl.DataFrame(
+    df_chunk = pl.DataFrame(
         {
             COL_MESSAGE_SURROGATE_ID: pl.Series(out_surrogate_ids, dtype=pl.Int64),
             COL_NGRAM_WORDS: pl.Series(out_words, dtype=pl.String),
         }
+    ).with_columns(
+        pl.col(COL_NGRAM_WORDS).hash(seed=NGRAM_HASH_SEED).alias(COL_NGRAM_HASH)
+    )
+
+    return (
+        df_chunk.select(COL_MESSAGE_SURROGATE_ID, COL_NGRAM_HASH),
+        df_chunk.select(COL_NGRAM_HASH, COL_NGRAM_WORDS).unique(subset=COL_NGRAM_HASH),
     )
 
 
 def _run_chunks(
     payloads: list[tuple], max_workers: int, progress_callback=None
-) -> list[pl.DataFrame]:
+) -> list[tuple[pl.DataFrame, pl.DataFrame]]:
     """Run _emit_ngram_pairs over payloads, in worker processes when worthwhile."""
     total = len(payloads)
 
@@ -120,7 +143,7 @@ def _run_chunks(
                 progress_callback(done / total)
         return frames
     else:
-        results: dict[int, pl.DataFrame] = {}
+        results: dict[int, tuple[pl.DataFrame, pl.DataFrame]] = {}
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(_emit_ngram_pairs, payload): index
@@ -183,16 +206,30 @@ def _extract_ngrams_from_messages(
         for start in range(0, df_input.height, chunk_size)
     ]
 
-    frames = _run_chunks(payloads, max_workers, progress_callback)
-    df_pairs = pl.concat(frames) if frames else _empty_pairs_frame()
+    chunk_results = _run_chunks(payloads, max_workers, progress_callback)
+    if chunk_results:
+        df_pairs = pl.concat([pairs for pairs, _ in chunk_results])
+        # one row per n-gram that exists anywhere in the corpus, rather than one per
+        # occurrence. This is the only place the text is materialised in full
+        df_hash_to_words = pl.concat([defs for _, defs in chunk_results]).unique(
+            subset=COL_NGRAM_HASH
+        )
+    else:
+        df_pairs = _empty_pairs_frame()
+        df_hash_to_words = _empty_defs_frame()
+    del chunk_results
 
-    # Sorting before assigning ids keeps ngram_id stable across runs: group_by output
-    # order is not deterministic, and the ids feed the sort order of the outputs.
+    _assert_no_hash_collisions(df_hash_to_words)
+
+    # grouping and filtering on the hash, neither touches string data
+    surviving_hashes = df_pairs.group_by(COL_NGRAM_HASH).len().filter(pl.col("len") > 1)
+
+    # sorting before assigning ids keeps ngram_id stable across runs. group_by output
+    # order is not deterministic, ids feed the sort order of the outputs
     df_ngram_defs = (
-        df_pairs.group_by(COL_NGRAM_WORDS)
-        .len()
-        .filter(pl.col("len") > 1)
-        .select(COL_NGRAM_WORDS)
+        df_hash_to_words.join(
+            surviving_hashes.select(COL_NGRAM_HASH), on=COL_NGRAM_HASH, how="inner"
+        )
         .sort(COL_NGRAM_WORDS)
         .with_row_index(COL_NGRAM_ID)
         .with_columns(
@@ -202,19 +239,50 @@ def _extract_ngrams_from_messages(
     )
 
     df_message_ngrams = df_pairs.join(
-        df_ngram_defs.select(COL_NGRAM_WORDS, COL_NGRAM_ID),
-        on=COL_NGRAM_WORDS,
+        df_ngram_defs.select(COL_NGRAM_HASH, COL_NGRAM_ID),
+        on=COL_NGRAM_HASH,
         how="inner",
     ).select(COL_MESSAGE_SURROGATE_ID, COL_NGRAM_ID)
 
-    return df_message_ngrams, df_ngram_defs
+    return df_message_ngrams, df_ngram_defs.select(
+        COL_NGRAM_ID, COL_NGRAM_WORDS, COL_NGRAM_LENGTH
+    )
+
+
+def _assert_no_hash_collisions(df_hash_to_words: pl.DataFrame) -> None:
+    """
+    Guard the assumption that a hash identifies exactly one n-gram.
+
+    Though unlikely, two n-grams sharing a hash would break us, and via the
+    birthday paradox, the chance of overlap across a few million n-grams is
+    higher than you may expect
+    """
+    if df_hash_to_words.is_empty():
+        return
+    distinct_words = df_hash_to_words[COL_NGRAM_WORDS].n_unique()
+    if distinct_words != df_hash_to_words.height:
+        raise RuntimeError(
+            "n-gram hash collision detected: "
+            f"{df_hash_to_words.height} hashes map to {distinct_words} distinct "
+            "n-grams. Counts for the colliding n-grams would be merged, so the run "
+            "has been stopped rather than produce incorrect results."
+        )
+
+
+def _empty_defs_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            COL_NGRAM_HASH: pl.Series([], dtype=pl.UInt64),
+            COL_NGRAM_WORDS: pl.Series([], dtype=pl.String),
+        }
+    )
 
 
 def _empty_pairs_frame() -> pl.DataFrame:
     return pl.DataFrame(
         {
             COL_MESSAGE_SURROGATE_ID: pl.Series([], dtype=pl.Int64),
-            COL_NGRAM_WORDS: pl.Series([], dtype=pl.String),
+            COL_NGRAM_HASH: pl.Series([], dtype=pl.UInt64),
         }
     )
 
