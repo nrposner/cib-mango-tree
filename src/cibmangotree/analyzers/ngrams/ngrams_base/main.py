@@ -1,6 +1,8 @@
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from math import ceil
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import polars as pl
 
@@ -58,6 +60,10 @@ MIN_ROWS_FOR_PARALLEL = 5_000
 
 # Several chunks per worker so uneven message lengths still balance across cores.
 CHUNKS_PER_WORKER = 4
+
+# Chunks submitted per worker in one wave. Bounds how many results can be in flight
+# at once without starving workers between waves
+CHUNKS_PER_WAVE = 2
 
 # Internal only, identifies an n-gram while its text is not being carried
 COL_NGRAM_HASH = "ngram_hash"
@@ -125,37 +131,54 @@ def _emit_ngram_pairs(
 
     return (
         df_chunk.select(COL_MESSAGE_SURROGATE_ID, COL_NGRAM_HASH),
-        df_chunk.select(COL_NGRAM_HASH, COL_NGRAM_WORDS).unique(subset=COL_NGRAM_HASH),
+        # deduplicated on (hash, text) rather than hash alone
+        # collapsing on the hash here would hide a collision instead of
+        # letting the caller detect one
+        df_chunk.select(COL_NGRAM_HASH, COL_NGRAM_WORDS).unique(),
     )
 
 
-def _run_chunks(
-    payloads: list[tuple], max_workers: int, progress_callback=None
-) -> list[tuple[pl.DataFrame, pl.DataFrame]]:
-    """Run _emit_ngram_pairs over payloads, in worker processes when worthwhile."""
+def _spill_chunks(
+    payloads: list[tuple],
+    max_workers: int,
+    spill_dir: Path,
+    progress_callback=None,
+) -> None:
+    """
+    Run _emit_ngram_pairs over payloads, writing each chunk's result straight to
+    parquet in `spill_dir` instead of returning it.
+
+    Work is submitted in bounded waves rather than all at once. `Future` objects hold
+    a reference to their result until they are themselves released, so submitting
+    everything up front would re-accumulate the whole table no matter how promptly
+    each result is written.
+    """
     total = len(payloads)
+    done = 0
+
+    def _write(index: int, result: tuple[pl.DataFrame, pl.DataFrame]) -> None:
+        pairs, defs = result
+        pairs.write_parquet(spill_dir / f"pairs_{index:06d}.parquet")
+        defs.write_parquet(spill_dir / f"defs_{index:06d}.parquet")
 
     if max_workers <= 1:
-        frames = []
-        for done, payload in enumerate(payloads, start=1):
-            frames.append(_emit_ngram_pairs(payload))
+        for index, payload in enumerate(payloads):
+            _write(index, _emit_ngram_pairs(payload))
+            done += 1
             if progress_callback:
                 progress_callback(done / total)
-        return frames
-    else:
-        results: dict[int, tuple[pl.DataFrame, pl.DataFrame]] = {}
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_emit_ngram_pairs, payload): index
-                for index, payload in enumerate(payloads)
-            }
-            for done, future in enumerate(as_completed(futures), start=1):
-                results[futures[future]] = future.result()
+        return
+
+    wave_size = max_workers * CHUNKS_PER_WAVE
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        for base in range(0, total, wave_size):
+            wave = payloads[base : base + wave_size]
+            for offset, result in enumerate(executor.map(_emit_ngram_pairs, wave)):
+                _write(base + offset, result)
+                del result
+                done += 1
                 if progress_callback:
                     progress_callback(done / total)
-
-        # Reassemble in submission order so the output does not depend on completion order.
-        return [results[index] for index in range(total)]
 
 
 def _extract_ngrams_from_messages(
@@ -165,12 +188,18 @@ def _extract_ngrams_from_messages(
     tokenizer_config: TokenizerConfig,
     progress_callback=None,
     max_workers: int | None = None,
+    spill_dir: str | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """
     Extract n-grams from messages with within-message deduplication.
 
     N-grams occurring in only one message are dropped immediately. These make up
     the great majority of distinct n-grams on a typical corpus.
+
+    Intermediate results are written to disk and read back lazily rather than being
+    held in memory: the occurrence table is much larger than either output derived
+    from it, and on a large corpus keeping it resident dominates the analyzer's
+    memory use.
 
     Args:
         df_input: Preprocessed dataframe with messages
@@ -179,6 +208,8 @@ def _extract_ngrams_from_messages(
         tokenizer_config: Configuration for text tokenization
         progress_callback: Optional callback for progress reporting
         max_workers: Worker processes to use. Defaults to one per available core.
+        spill_dir: Directory to place scratch files under. Defaults to the system
+            temp location. Files are removed before this function returns.
 
     Returns:
         Tuple of (df_message_ngrams, df_ngram_defs) where:
@@ -206,83 +237,109 @@ def _extract_ngrams_from_messages(
         for start in range(0, df_input.height, chunk_size)
     ]
 
-    chunk_results = _run_chunks(payloads, max_workers, progress_callback)
-    if chunk_results:
-        df_pairs = pl.concat([pairs for pairs, _ in chunk_results])
-        # one row per n-gram that exists anywhere in the corpus, rather than one per
-        # occurrence. This is the only place the text is materialised in full
-        df_hash_to_words = pl.concat([defs for _, defs in chunk_results]).unique(
-            subset=COL_NGRAM_HASH
+    if not payloads:
+        return _empty_message_ngrams_frame(), _empty_ngram_defs_frame()
+
+    # Spill under the analyzer's temp dir when one was supplied, so the scratch files
+    # land on the same volume the rest of the run uses and are cleaned up with it.
+    with TemporaryDirectory(dir=spill_dir) as tmp:
+        spill_path = Path(tmp)
+        _spill_chunks(payloads, max_workers, spill_path, progress_callback)
+
+        pairs = pl.scan_parquet(spill_path / "pairs_*.parquet")
+        chunk_defs = pl.scan_parquet(spill_path / "defs_*.parquet")
+
+        _assert_no_hash_collisions(chunk_defs)
+
+        # Grouping and filtering happen on the hash, so neither touches string data.
+        surviving_hashes = (
+            pairs.group_by(COL_NGRAM_HASH).len().filter(pl.col("len") > 1)
         )
-    else:
-        df_pairs = _empty_pairs_frame()
-        df_hash_to_words = _empty_defs_frame()
-    del chunk_results
 
-    _assert_no_hash_collisions(df_hash_to_words)
-
-    # grouping and filtering on the hash, neither touches string data
-    surviving_hashes = df_pairs.group_by(COL_NGRAM_HASH).len().filter(pl.col("len") > 1)
-
-    # sorting before assigning ids keeps ngram_id stable across runs. group_by output
-    # order is not deterministic, ids feed the sort order of the outputs
-    df_ngram_defs = (
-        df_hash_to_words.join(
-            surviving_hashes.select(COL_NGRAM_HASH), on=COL_NGRAM_HASH, how="inner"
+        # One row per n-gram that survives, rather than one per occurrence: this is
+        # the only place the text is materialised.
+        # Sorting before assigning ids keeps ngram_id stable across runs, since
+        # group_by output order is not deterministic and the ids feed the sort order
+        # of the outputs.
+        df_ngram_defs = (
+            chunk_defs.unique(subset=COL_NGRAM_HASH)
+            .join(
+                surviving_hashes.select(COL_NGRAM_HASH),
+                on=COL_NGRAM_HASH,
+                how="inner",
+            )
+            .collect(engine="streaming")
+            .sort(COL_NGRAM_WORDS)
+            .with_row_index(COL_NGRAM_ID)
+            .with_columns(
+                pl.col(COL_NGRAM_ID).cast(pl.Int64),
+                pl.col(COL_NGRAM_WORDS)
+                .str.split(" ")
+                .list.len()
+                .alias(COL_NGRAM_LENGTH),
+            )
         )
-        .sort(COL_NGRAM_WORDS)
-        .with_row_index(COL_NGRAM_ID)
-        .with_columns(
-            pl.col(COL_NGRAM_ID).cast(pl.Int64),
-            pl.col(COL_NGRAM_WORDS).str.split(" ").list.len().alias(COL_NGRAM_LENGTH),
-        )
-    )
 
-    df_message_ngrams = df_pairs.join(
-        df_ngram_defs.select(COL_NGRAM_HASH, COL_NGRAM_ID),
-        on=COL_NGRAM_HASH,
-        how="inner",
-    ).select(COL_MESSAGE_SURROGATE_ID, COL_NGRAM_ID)
+        df_message_ngrams = (
+            pairs.join(
+                df_ngram_defs.lazy().select(COL_NGRAM_HASH, COL_NGRAM_ID),
+                on=COL_NGRAM_HASH,
+                how="inner",
+            )
+            .select(COL_MESSAGE_SURROGATE_ID, COL_NGRAM_ID)
+            .collect(engine="streaming")
+        )
 
     return df_message_ngrams, df_ngram_defs.select(
         COL_NGRAM_ID, COL_NGRAM_WORDS, COL_NGRAM_LENGTH
     )
 
 
-def _assert_no_hash_collisions(df_hash_to_words: pl.DataFrame) -> None:
+def _assert_no_hash_collisions(chunk_defs: pl.LazyFrame) -> None:
     """
     Guard the assumption that a hash identifies exactly one n-gram.
 
     Though unlikely, two n-grams sharing a hash would break us, and via the
     birthday paradox, the chance of overlap across a few million n-grams is
-    higher than you may expect
+    higher than you may expect.
+
+    Chunks emit (hash, text) pairs already deduplicated, so a hash appearing
+    more than once here means two different n-grams produced it. Checking it
+    this way groups on the hash alone instead of making a large number of
+    string comparisons
     """
-    if df_hash_to_words.is_empty():
-        return
-    distinct_words = df_hash_to_words[COL_NGRAM_WORDS].n_unique()
-    if distinct_words != df_hash_to_words.height:
+    collisions = (
+        chunk_defs.unique()
+        .group_by(COL_NGRAM_HASH)
+        .len()
+        .filter(pl.col("len") > 1)
+        .head(1)
+        .collect(engine="streaming")
+    )
+    if not collisions.is_empty():
         raise RuntimeError(
-            "n-gram hash collision detected: "
-            f"{df_hash_to_words.height} hashes map to {distinct_words} distinct "
-            "n-grams. Counts for the colliding n-grams would be merged, so the run "
-            "has been stopped rather than produce incorrect results."
+            "n-gram hash collision detected: two distinct n-grams share the hash "
+            f"{collisions[0, COL_NGRAM_HASH]}. Their occurrence counts would be "
+            "merged, so the run has been stopped rather than produce incorrect "
+            "results."
         )
 
 
-def _empty_defs_frame() -> pl.DataFrame:
+def _empty_message_ngrams_frame() -> pl.DataFrame:
     return pl.DataFrame(
         {
-            COL_NGRAM_HASH: pl.Series([], dtype=pl.UInt64),
-            COL_NGRAM_WORDS: pl.Series([], dtype=pl.String),
+            COL_MESSAGE_SURROGATE_ID: pl.Series([], dtype=pl.Int64),
+            COL_NGRAM_ID: pl.Series([], dtype=pl.Int64),
         }
     )
 
 
-def _empty_pairs_frame() -> pl.DataFrame:
+def _empty_ngram_defs_frame() -> pl.DataFrame:
     return pl.DataFrame(
         {
-            COL_MESSAGE_SURROGATE_ID: pl.Series([], dtype=pl.Int64),
-            COL_NGRAM_HASH: pl.Series([], dtype=pl.UInt64),
+            COL_NGRAM_ID: pl.Series([], dtype=pl.Int64),
+            COL_NGRAM_WORDS: pl.Series([], dtype=pl.String),
+            COL_NGRAM_LENGTH: pl.Series([], dtype=pl.UInt32),
         }
     )
 
@@ -312,7 +369,12 @@ def main(context: PrimaryAnalyzerContext):
 
     with progress("Detecting n-grams") as reporter:
         df_ngram_instances, df_ngram_defs = _extract_ngrams_from_messages(
-            df_input, min_n, max_n, tokenizer_config, reporter.update
+            df_input,
+            min_n,
+            max_n,
+            tokenizer_config,
+            reporter.update,
+            spill_dir=context.temp_dir,
         )
 
     with progress("Fetching n-gram statistics"):
