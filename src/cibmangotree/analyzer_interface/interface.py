@@ -82,10 +82,11 @@ class AnalyzerParam(BaseModel):
         return self.human_readable_name or self.id
 
 
-class OutputHydration(BaseModel):
+class OutputDeNormalization(BaseModel):
     """
     Declares columns that an output deliberately omits from its parquet file and
-    re-joins only when the output is exported.
+    re-joins only when the output is exported. This helps us to avoid massively
+    duplicating data in memory.
 
     Use this when a column is large, repetitive, and already stored elsewhere.
     This keeps the working file small while the final export remains unchanged
@@ -123,10 +124,10 @@ class AnalyzerOutput(BaseModel):
 
     internal: bool = False
 
-    hydrate: Optional[OutputHydration] = None
+    denormalize: Optional[OutputDeNormalization] = None
     """
   Optional: columns omitted from the parquet on disk and re-joined at export time.
-  See `OutputHydration`.
+  See `OutputDeNormalization`.
   """
 
     def get_column_by_name(self, name: str):

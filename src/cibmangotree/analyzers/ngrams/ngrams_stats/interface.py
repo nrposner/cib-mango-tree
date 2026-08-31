@@ -1,7 +1,7 @@
 from cibmangotree.analyzer_interface import (
     AnalyzerOutput,
     OutputColumn,
-    OutputHydration,
+    OutputDeNormalization,
     SecondaryAnalyzerInterface,
 )
 
@@ -103,7 +103,7 @@ interface = SecondaryAnalyzerInterface(
             # existing data and accounts for the vast majority of file size on
             # corpuses with long messages. Instead, we store COL_MESSAGE_ID
             # and re-join only when necessary
-            hydrate=OutputHydration(
+            denormalize=OutputDeNormalization(
                 source_output=OUTPUT_MESSAGE,
                 join_on=COL_MESSAGE_SURROGATE_ID,
                 columns=[COL_MESSAGE_TEXT],

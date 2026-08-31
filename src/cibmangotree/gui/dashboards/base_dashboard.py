@@ -86,7 +86,7 @@ class BaseDashboardPage(GuiPage, abc.ABC):
         Get path to a *primary* output parquet file for the current analysis.
 
         Dashboards need this to look up columns that a secondary output deliberately
-        omits to keep its own file small (see `OutputHydration`).
+        omits to keep its own file small (see `OutputDeNormalization`).
         """
         analysis = self.session.current_analysis
         if analysis is None:
